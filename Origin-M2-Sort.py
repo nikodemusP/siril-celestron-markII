@@ -14,6 +14,7 @@ class sirilFolder:
     master_name: str
     moved: int
 
+# Base Configuration, how the files are sorted
 dir_config = [
     sirilFolder(fileName="light", targetDir="lights", master_name="",            moved=0),
     sirilFolder(fileName="bias",  targetDir="biases", master_name="bias_master", moved=0),
@@ -21,32 +22,24 @@ dir_config = [
     sirilFolder(fileName="flat",  targetDir="flats",  master_name="flat_master", moved=0)]
 
 
+# Single siril command execution with logging
 def cmd(command: str):
-    """Siril-Befehl als einzelner String übergeben."""
     print(f"[CMD]  {command}")
     siril.cmd(command)
 
-
+# List all FiTS files in a folder
 def fits_files(folder: Path):
-    """Liste aller FITS-Dateien in einem Ordner."""
     return sorted(list(folder.glob("*.fits")) + list(folder.glob("*.fit")))
 
-
+# Count the number of FiTS files in a folder
 def fits_in(folder: Path) -> int:
-    """Anzahl FITS-Dateien in einem Ordner."""
     return len(fits_files(folder))
 
-
+# Build a master calibration file from the files in targetDir/
+#   - 0 files  -> skipped
+#   - 1 file   -> simply copied & renamed (Origin already provides an internally stacked file, no re-stacking needed)
+#   - >1 files -> stacked into a real master
 def build_master(sirilFolder: sirilFolder):
-    """
-    Erstellt aus den Dateien in targetDir/ eine Master-Kalibrierdatei
-    in masters_dir/.
-
-      - 0 Dateien  -> übersprungen
-      - 1 Datei    -> einfach kopiert & umbenannt (Origin liefert bereits
-                       eine intern gestackte Datei, kein erneutes Stacken nötig)
-      - >1 Dateien -> per Siril zu einem echten Master gestackt
-    """
     workdir = Path(siril.get_siril_wd())
     masters_dir = workdir / "masters"
     src_dir = workdir / sirilFolder.targetDir
@@ -55,13 +48,13 @@ def build_master(sirilFolder: sirilFolder):
     target_name = sirilFolder.master_name
 
     if n == 0:
-        print(f"[WARN] Keine {sirilFolder.fileName}-Frames in {sirilFolder.targetDir}/, überspringe Master.")
+        print(f"[WARN] No {sirilFolder.fileName}-Frames in {sirilFolder.targetDir}/, skip master creation.")
         return None
 
     if n == 1:
         dst_file = masters_dir / f"{sirilFolder.master_name}.fits"
         shutil.copy(str(files[0]), str(dst_file))
-        print(f"[OK]   Einzelne Datei übernommen: {files[0].name} → masters/{sirilFolder.master_name}.fits")
+        print(f"[OK]   Single file copied: {files[0].name} → masters/{sirilFolder.master_name}.fits")
         return dst_file
 
     # --- mehrere Subframes: in Siril konvertieren und stacken ---
@@ -70,10 +63,14 @@ def build_master(sirilFolder: sirilFolder):
     cmd(f"convert {sirilFolder.fileName} -out=../process")
     cmd("cd ../process")
 
+    # Flat is a single file, but it needs to be calibrated with the bias before stacking. 
+    # So we check if a bias master exists and use it for calibration.
     if sirilFolder.fileName == "flat":
-        master_bias = masters_dir / "master_bias.fits"
-        if master_bias.exists():
-            cmd(f"calibrate flat -bias=../masters/master_bias")
+        bias_cfg = next((c for c in dir_config if c.fileName == "bias"), None)
+        master_bias = masters_dir / f"{bias_cfg.master_name}.fits" if bias_cfg and bias_cfg.master_name else None
+
+        if master_bias and master_bias.exists():
+            cmd(f"calibrate flat -bias=../masters/{bias_cfg.master_name}")
             cmd("stack pp_flat rej 3 3 -norm=mul")
             stacked_name = "pp_flat_stacked.fits"
         else:
@@ -97,11 +94,11 @@ def build_master(sirilFolder: sirilFolder):
     return dst_file
 
 try:
-    # ── 1) Arbeitsverzeichnis ────────────────────────────────
+    # ── 1) Working-Directory ────────────────────────────────
     workdir = Path(siril.get_siril_wd())
     print(f"[INFO] Arbeitsverzeichnis: {workdir}")
 
-    # ── 2) Dateien in lights/biases/darks/flats verschieben ──
+    # ── 2) sort files into lights/biases/darks/flats ──
     for sirilFolder in dir_config:
         sirilFolder.moved = 0
         (workdir / sirilFolder.targetDir).mkdir(exist_ok=True)
@@ -117,14 +114,15 @@ try:
             if f.suffix.lower() not in (".fits", ".fit"):
                 continue
 
-            shutil.move(str(f), str(workdir / sirilFolder.targetDir / f.name))
+            # Move the file to the target directory and rename it to lowercase
+            shutil.move(str(f), str(workdir / sirilFolder.targetDir / f.name.lower()))
             print(f"[OK]   {f.name}  →  {sirilFolder.targetDir}/")
             sirilFolder.moved += 1
 
     for sirilFolder in dir_config:
         print(f"[INFO] {sirilFolder.fileName.capitalize()}-Frames: {sirilFolder.moved}")
 
-    # ── 3) Master-Kalibrierdateien bauen ─────────────────────
+    # ── 3) build Master-Calidration ─────────────────────
     print(f"[INFO] building the master calibration files...")
     masters_dir = workdir / "masters"
     masters_dir.mkdir(exist_ok=True)
@@ -135,12 +133,12 @@ try:
             continue
         build_master(sirilFolder)
 
-    print("\n[FERTIG] Master-Dateien liegen in masters/:")
+    print("\n[FERTIG] master-files are located in masters/:")
     for f in sorted(masters_dir.glob("*.fits")):
         print(f"         {f.name}")
 
 except Exception as e:
-    print(f"\n[FEHLER] {e}")
+    print(f"\n[Error] {e}")
     raise
 
 finally:
