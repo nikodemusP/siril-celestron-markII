@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
@@ -21,16 +22,18 @@ from PyQt6.QtWidgets import (
     QFrame,
     QLabel,
     QPushButton,
-    QCheckBox,
-    QDoubleSpinBox,
-    QComboBox,
-    QGroupBox,
-    QMessageBox,
-    QFileDialog,
-    QSpinBox,
     QScrollArea,
     QProgressBar,
 )
+
+    # QCheckBox,
+    # QDoubleSpinBox,
+    # QComboBox,
+    # QGroupBox,
+    # QMessageBox,
+    # QFileDialog,
+    # QSpinBox,
+
 from sirilpy import LogColor, NoImageError
 from PyQt6.QtCore import pyqtSlot as Slot, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QShortcut, QKeySequence
@@ -38,8 +41,16 @@ from PyQt6.QtGui import QFont, QShortcut, QKeySequence
 APP_NAME = "Origin-Mark2 Processing"
 VERSION = "0.1.0"
 
+@dataclass
+class Plugin:
+    class_name: str
+    enabled: bool
+    instance: object = None
+
+
 PLUGIN_CONFIG = [
-    {"keyName": "O2SortFiles", "class": "OriginMark2FileSorter", "enabled": True}
+    Plugin(class_name="OriginMark2FileSorter", enabled=True),
+    Plugin(class_name="CalibratePlugin",       enabled=True)
 ]
 
 class ProcessingInterface(QMainWindow):
@@ -56,16 +67,17 @@ class ProcessingInterface(QMainWindow):
         self.workDir = self.siril.get_siril_wd()
         # Load the plugins
         self.siril.log(f"load plugins", LogColor.GREEN)
-        self.plugins = {}
+
+        context = originM2lib.PluginContext(siril=self.siril, config=self.project_config)
+
         for plugin_info in PLUGIN_CONFIG:
-            if plugin_info.get("enabled", True):
-                key_name = plugin_info["keyName"]
-                class_name  = plugin_info["class"]
+            if plugin_info.enabled:
+                class_name = plugin_info.class_name
                 try:
                     module = __import__(f"originM2Plugins.{class_name}", fromlist=[class_name])
                     plugin_class = getattr(module, class_name)
-                    plugin_instance = plugin_class(self.siril, self.project_config)
-                    self.plugins[key_name] = plugin_instance
+                    plugin_instance = plugin_class(context)
+                    plugin_info.instance = plugin_instance
                     self.siril.log(f"Loaded plugin: {plugin_instance.get_plugin_name()}", LogColor.GREEN)
                 except Exception as e:
                     self.siril.log(f"Error loading plugin {class_name} from originM2Plugins.{class_name}: {e}", LogColor.RED)
@@ -126,9 +138,9 @@ class ProcessingInterface(QMainWindow):
         content_layout.addWidget(info_box)
     
         for plugin_info in PLUGIN_CONFIG:
-            plugin_instance = self.plugins.get(plugin_info["keyName"])
-            if plugin_instance:
-                content_layout.addWidget(plugin_instance._create_widget())
+            if plugin_info.enabled and plugin_info.instance is not None:
+                plugin_box = plugin_info.instance.create_plugin_box()
+                content_layout.addWidget(plugin_box)
 
         # Progress Bar
         self.progress_bar = QProgressBar()

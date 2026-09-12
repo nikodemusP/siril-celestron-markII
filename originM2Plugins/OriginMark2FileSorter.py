@@ -1,7 +1,7 @@
 import shutil
 from pathlib import Path
 from dataclasses import dataclass
-from originM2lib import om2_plugin
+from originM2lib.om2_plugin import Plugin, PluginContext, PluginItem
 from sirilpy import LogColor
 
 from PyQt6.QtWidgets import (
@@ -22,32 +22,25 @@ dir_config = [
     sirilFolder(fileName="dark",  targetDir="darks",  master_name="dark_master", moved=0),
     sirilFolder(fileName="flat",  targetDir="flats",  master_name="flat_master", moved=0)]
 
-class OriginMark2FileSorter(om2_plugin.plugin):
+sorterItems = [
+    PluginItem(key="sort_files", label="Sort Files", kind="checkbox", default=False)]
 
-    def get_plugin_name(self):
-        return "O2SortFiles"
+class OriginMark2FileSorter(Plugin):
 
-    def get_title_name(self):
-        return "Sort Files"
-
-    def create_widget(self, group_layout):
-        # Create a button to trigger the sorting process
-        self.siril.log(f"create widget for {self.plugin_name}", LogColor.GREEN)
-        self.done_box = QCheckBox("Processing done")
-        self.done_box.setEnabled(False)   # not user-interactive, purely informational
-        self.done_box.setChecked(self.config.get("finished", False))
-        group_layout.addWidget(self.done_box)
+    def __init__(self, context: PluginContext):
+        super().__init__(context)
+        self.setUp("sorter", "Sort Files", sorterItems)
 
     def process(self):
         # ── 1) Working-Directory ────────────────────────────────
         workdir = Path(self.get_siril_wd())
-        self.siril.log(f"[INFO] Working Directory: {workdir}", LogColor.GREEN)
+        self.context.siril.log(f"[INFO] Working Directory: {workdir}", LogColor.GREEN)
 
         # ── 2) sort files into lights/biases/darks/flats ──
         for sirilFolder in dir_config:
             sirilFolder.moved = 0
             (workdir / sirilFolder.targetDir).mkdir(exist_ok=True)
-            self.siril.log(f"[OK]   Ordner: {sirilFolder.targetDir}/", LogColor.GREEN)
+            self.context.siril.log(f"[OK]   Ordner: {sirilFolder.targetDir}/", LogColor.GREEN)
             for f in sorted(workdir.iterdir()):
                 if not f.is_file():
                     continue
@@ -61,33 +54,30 @@ class OriginMark2FileSorter(om2_plugin.plugin):
 
                 # Move the file to the target directory and rename it to lowercase
                 shutil.move(str(f), str(workdir / sirilFolder.targetDir / f.name.lower()))
-                self.siril.log(f"[OK]   {f.name}  →  {sirilFolder.targetDir}/", LogColor.GREEN)
+                self.context.siril.log(f"[OK]   {f.name}  →  {sirilFolder.targetDir}/", LogColor.GREEN)
                 sirilFolder.moved += 1
 
         for sirilFolder in dir_config:
-            self.siril.log(f"[INFO] {sirilFolder.fileName.capitalize()}-Frames: {sirilFolder.moved}", LogColor.GREEN)
+            self.context.siril.log(f"[INFO] {sirilFolder.fileName.capitalize()}-Frames: {sirilFolder.moved}", LogColor.GREEN)
 
-        # ── 3) build Master-Calidration ─────────────────────
-        self.siril.log(f"[INFO] building the master calibration files...", LogColor.GREEN)
+        # ── 3) create process directories and cleanup ─────────────────────
         masters_dir = workdir / "masters"
-        masters_dir.mkdir(exist_ok=True)
-        (workdir / "process").mkdir(exist_ok=True)
+        self.reset_dir(masters_dir)
+        self.reset_dir(workdir / "process")
+
+        # ── 4) build Master-Calidration ─────────────────────
+        self.context.siril.log(f"[INFO] building the master calibration files...", LogColor.GREEN)
 
         for sirilFolder in dir_config:
             if sirilFolder.master_name == "":
                 continue
             self.build_master(sirilFolder)
 
-        self.siril.log(f"\n[FERTIG] master-files are located in masters/:", LogColor.GREEN)
+        self.context.siril.log(f"\n[FERTIG] master-files are located in masters/:", LogColor.GREEN)
         for f in sorted(masters_dir.glob("*.fits")):
-            self.siril.log(f"         {f.name}", LogColor.GREEN)
+            self.context.siril.log(f"         {f.name}", LogColor.GREEN)
 
         self.config["finished"] = True
-
-    # Single siril command execution with logging
-    def cmd(self, command: str):
-        print(f"[CMD]  {command}")
-        self.siril.cmd(command)
 
     # List all FiTS files in a folder
     def fits_files(self, folder: Path):
@@ -154,3 +144,7 @@ class OriginMark2FileSorter(om2_plugin.plugin):
             return None
 
         return dst_file
+
+    def reset_dir(self, path: Path):
+        shutil.rmtree(path, ignore_errors=True)
+        path.mkdir(exist_ok=True)
