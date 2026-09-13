@@ -1,25 +1,49 @@
 import shutil
 from pathlib import Path
 from dataclasses import dataclass
-from originM2lib.om2_plugin import Plugin, PluginContext, PluginItem
+from sirilpyBatch.sirilpyBatch import BatchPlugin, BatchPluginRegistry, PluginItem
 from sirilpy import LogColor
 
-class CalibratePlugin(Plugin):
+calibrate_items = [
+    PluginItem(
+        kind="checkbox",  
+        key="cfa",          
+        label="CFA format",
+        colspan=2,
+        default=False),
+    PluginItem(
+        kind="checkbox",  
+        key="equalize_cfa", 
+        label="equalize CFA", 
+        colspan=2,
+        default=False),
+    PluginItem(
+        kind="checkbox",  
+        key="debayer",      
+        label="Debayer",      
+        colspan=2,
+        default=False),
+    PluginItem(
+        kind="separator", 
+        key="sep1"),
+    PluginItem(
+        kind="int",       
+        key="sigma_low",    
+        label="Sigma Low",    
+        colspan=2,
+        default=3),
+    PluginItem(
+        kind="int",       
+        key="sigma_high",   
+        label="Sigma High",   
+        colspan=2,
+        default=3),
+]
+
+@BatchPluginRegistry.register(key="calibrate", title="Calibrate", items=calibrate_items, columns=6)
+class CalibratePlugin(BatchPlugin):
 
     result_name = "calibration"
-
-    calibrate_items = [
-        PluginItem(kind="checkbox",  key="cfa",          label="CFA format",   default=False),
-        PluginItem(kind="checkbox",  key="equalize_cfa", label="equalize CFA", default=False),
-        PluginItem(kind="checkbox",  key="debayer",      label="Debayer",      default=False),
-        PluginItem(kind="separator", key="sep1"),
-        PluginItem(kind="int",       key="sigma_low",    label="Sigma Low",    default=3),
-        PluginItem(kind="int",       key="sigma_high",   label="Sigma High",   default=3),
-    ]
-
-    def __init__(self, context: PluginContext):
-        super().__init__(context)
-        self.setUp("calibrate", "Calibrate", self.calibrate_items)
 
     def process(self):
         # ── 1) Convert Lights ─────────────────────────────

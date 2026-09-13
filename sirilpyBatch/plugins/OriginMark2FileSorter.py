@@ -1,12 +1,13 @@
 import shutil
 from pathlib import Path
 from dataclasses import dataclass
-from originM2lib.om2_plugin import Plugin, PluginContext, PluginItem
 from sirilpy import LogColor
 
 from PyQt6.QtWidgets import (
     QCheckBox,
 )
+
+from sirilpyBatch.sirilpyBatch import BatchPlugin, BatchPluginRegistry, PluginItem
 
 @dataclass
 class sirilFolder:
@@ -22,14 +23,8 @@ dir_config = [
     sirilFolder(fileName="dark",  targetDir="darks",  master_name="dark_master", moved=0),
     sirilFolder(fileName="flat",  targetDir="flats",  master_name="flat_master", moved=0)]
 
-sorterItems = [
-    PluginItem(key="sort_files", label="Sort Files", kind="checkbox", default=False)]
-
-class OriginMark2FileSorter(Plugin):
-
-    def __init__(self, context: PluginContext):
-        super().__init__(context)
-        self.setUp("sorter", "Sort Files", sorterItems)
+@BatchPluginRegistry.register(key="sorter", title="Sort Files", items=None)
+class OriginMark2FileSorter(BatchPlugin):
 
     def process(self):
         # ── 1) Working-Directory ────────────────────────────────
@@ -76,8 +71,6 @@ class OriginMark2FileSorter(Plugin):
         self.context.siril.log(f"\n[FERTIG] master-files are located in masters/:", LogColor.GREEN)
         for f in sorted(masters_dir.glob("*.fits")):
             self.context.siril.log(f"         {f.name}", LogColor.GREEN)
-
-        self.config["finished"] = True
 
     # List all FiTS files in a folder
     def fits_files(self, folder: Path):
