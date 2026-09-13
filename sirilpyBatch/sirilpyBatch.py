@@ -1,0 +1,1543 @@
+"""
+sirilpyBatch - a Siril PyQt6 batch-processing front end.
+
+Lets the user drag-and-drop plugins from a sidebar list into an ordered
+batch, configure each one through its own widget box, reorder/remove them,
+and run the batch against a running Siril instance. Batch composition and
+per-plugin settings are persisted to YAML so a project can be reopened later.
+
+Key building blocks:
+    BatchConfig          - reads/writes the YAML config & presets files.
+    BatchContext         - shared (siril, config) handle passed to plugins.
+    PluginItem           - declarative description of one config widget.
+    PluginConfigBox      - renders a plugin's PluginItem list + Load/Process buttons.
+    BatchPlugin          - base class plugin authors subclass.
+    BatchPluginRegistry  - collects plugins registered via @register(...).
+    PluginContainer      - the drop target holding the ordered, active plugins.
+    PluginList           - the draggable sidebar list of available plugins.
+    Batch                - the main window tying everything together.
+"""
+
+from abc import abstractmethod
+from dataclasses import dataclass, field
+import importlib
+import os
+from pathlib import Path
+import pathlib
+import pkgutil
+import sys
+from typing import Any, Optional, Type
+import yaml
+import sirilpy as s
+from sirilpy import LogColor
+from PyQt6.QtCore import QMimeData, Qt, pyqtSignal
+from PyQt6.QtGui import QPixmap, QDrag
+from PyQt6.QtWidgets import (
+    QApplication,
+    QFormLayout,
+    QFrame,
+    QLayout,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QSizePolicy,
+    QSlider,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QCheckBox,
+    QDoubleSpinBox,
+    QComboBox,
+    QGroupBox,
+    QMessageBox,
+    QFileDialog,
+    QSpinBox,
+    QScrollArea,
+    QProgressBar,
+)
+
+APP_NAME = "sirilpyBatch"
+VERSION = "0.1.0"
+
+
+# ------------------------------------------------------------------------------------------
+class BatchConfig:
+    """
+    Reads and writes the plugin's on-disk configuration.
+
+    Two separate files are involved:
+      * ``config.yaml``               - per-project settings, stored in the current
+                                         Siril working directory (created on first use).
+    """
+
+    def __init__(self, siril):
+        self.siril = siril
+        # Siril's persistent per-user data directory (presets live here).
+        self.config_Dir = siril.get_siril_userdatadir()
+
+    def readPresetConfig(self):
+        """Load the user-wide presets file, or None if it doesn't exist yet / fails to parse."""
+        self.siril.log(f"read preset config", LogColor.GREEN)
+        presets_file = Path(self.config_Dir) / "origin_m2_presets.yaml"
+        if not presets_file.exists():
+            self.siril.log("Presets file not found: orgin_m2_presets.yaml", LogColor.RED)
+            return None
+        try:
+            with open(presets_file, "r") as f:
+                presets = yaml.safe_load(f)
+                self.siril.log("Presets loaded successfully.", LogColor.GREEN)
+                return presets
+        except Exception as e:
+            self.siril.log(f"Error reading presets file: {str(e)}", LogColor.RED)
+            return None
+
+    def storePresets(self, config):
+        """Persist the user-wide presets dict to ``origin_m2_presets.yaml``."""
+        presets_file = Path(self.config_Dir) / "origin_m2_presets.yaml"
+        try:
+            with open(presets_file, "w") as f:
+                yaml.dump(config, f)
+                self.siril.log("Configuration saved successfully.", LogColor.GREEN)
+        except Exception as e:
+            self.siril.log(f"Error saving configuration file: {str(e)}", LogColor.RED)
+
+
+# ------------------------------------------------------------------------------------------
+@dataclass
+class BatchContext:
+    """
+    Shared, read-only-ish handle passed to every plugin instance.
+
+    Bundles the live Siril connection (``siril``) together with the project's
+    persisted configuration dict (``config``), so plugins never need to know
+    where either of those come from.
+    """
+
+    siril: Any
+    config: dict
+
+
+# ------------------------------------------------------------------------------------------
+@dataclass
+class PluginItem:
+    """
+    Declarative description of a single configuration control inside a plugin's box.
+
+    A plugin describes its UI as a list of ``PluginItem`` objects; ``PluginConfigBox``
+    turns each one into the matching Qt widget (see ``_create_item_widget``).
+    """
+
+    kind: str  # "checkbox" | "slider" | "int" | "float" | "text" | "separator"
+    key: str  # internal key used to read/write this item's value
+
+    label: str = None  # label for the widget
+    default: Any = None
+    minimum: float = 0
+    maximum: float = 100
+    step: float = 1
+    decimals: int = 2  # used only by "float" items
+    tooltip: str = ""
+    value: Any = None
+    colspan: int = 1  # how many grid columns this item's cell should occupy (e.g. for a
+    # wide text field); clamped to the box's total column count and will
+    # wrap to a new row if it doesn't fit in the remaining space.
+
+
+# ------------------------------------------------------------------------------------------
+class PluginConfigBox(QGroupBox):
+    """
+    A checkable group box that renders a plugin's ``PluginItem`` list as a
+    grid of labeled widgets, plus an optional "Load" and/or "Process" button.
+
+    Signals:
+        valueChanged(str, object) -> active on each value change of the contained widgets, emits (key, value)
+        loadRequested()           -> "Load" button was clicked (only if has_load=True)
+        processRequested()        -> "Process" button was clicked (only if has_process=True)
+    """
+
+    valueChanged = pyqtSignal(str, object)
+
+    loadRequested = pyqtSignal()
+    processRequested = pyqtSignal()
+
+    def __init__(
+        self,
+        title: str,
+        items: list[PluginItem],
+        parent: Optional[QWidget] = None,
+        has_load: bool = False,
+        has_process: bool = False,
+        columns: int = 5,
+    ):
+        super().__init__(title, parent)
+
+        self.items = items
+        self.columns = max(1, columns)
+
+        # Maps PluginItem.key -> the live Qt widget holding that item's value.
+        self.widgets: dict[str, QWidget] = {}
+
+        # The box itself is checkable; its checked state is the plugin's "active" flag.
+        self.setCheckable(True)
+        self.setChecked(True)
+
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+
+        self._create_ui(has_load=has_load, has_process=has_process)
+
+    # ------------------------------------------------------------------
+    def _create_ui(self, has_load: bool, has_process: bool):
+        """
+        Lay out ``self.items`` in a grid with ``self.columns`` columns
+        (wrapping to a new row as needed), then append the Load/Process
+        button row at the bottom if requested.
+
+        A "separator" item forces a line break and draws a thin horizontal
+        rule spanning the full width of the grid.
+        """
+        main_layout = QVBoxLayout(self)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(
+            4
+        )  # keep rows close together, especially when items span full width
+        # Reserve all `columns` as equal-width slots up front. Without this,
+        # Qt only creates as many grid columns as actually have a widget in
+        # them, so a colspan=2 item on a 3-column grid would stretch to fill
+        # 100% of the width instead of the intended 2/3, whenever nothing
+        # else ever lands in the 3rd column.
+        for col in range(self.columns):
+            grid.setColumnStretch(col, 1)
+
+        row = 0
+        column = 0
+
+        for item in self.items:
+            if item.kind == "separator":
+                # Start the separator on its own row, even if the current
+                # row isn't full yet.
+                if column != 0:
+                    row += 1
+                    column = 0
+
+                line = QLabel()
+                line.setFixedHeight(1)
+
+                grid.addWidget(line, row, 0, 1, self.columns)
+
+                row += 1
+                continue
+
+            widget = self._create_item_widget(item)
+
+            if widget is None:
+                continue
+
+            # Clamp the requested span to a sane range and wrap to a fresh
+            # row first if it wouldn't fit in the remaining columns.
+            span = max(1, min(item.colspan, self.columns))
+            if column + span > self.columns:
+                column = 0
+                row += 1
+
+            # Each cell is its own little "label beside widget" mini-layout.
+            label = QLabel(item.label)
+            if item.tooltip:
+                label.setToolTip(item.tooltip)
+                widget.setToolTip(item.tooltip)
+
+            # Label and widget side by side on one line.
+            cell = QHBoxLayout()
+            cell.setContentsMargins(0, 0, 0, 0)
+            cell.setSpacing(6)
+
+            label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+            widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+            cell.addWidget(label)
+            cell.addWidget(widget, 1)
+
+            container = QWidget()
+            container.setLayout(cell)
+
+            grid.addWidget(container, row, column, 1, span)
+            self.widgets[item.key] = widget
+
+            # Advance past the cell(s) just used, wrapping to a new row when full.
+            column += span
+            if column >= self.columns:
+                column = 0
+                row += 1
+
+        main_layout.addLayout(grid)
+
+        # Optional footer row with Load/Process buttons, right-aligned.
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        if has_load:
+            load_button = QPushButton("Load")
+            load_button.clicked.connect(self.loadRequested.emit)
+            buttons.addWidget(load_button)
+
+        if has_process:
+            process_button = QPushButton("Process")
+            process_button.clicked.connect(self.processRequested.emit)
+            buttons.addWidget(process_button)
+
+        if has_load or has_process:
+            main_layout.addLayout(buttons)
+
+    # ------------------------------------------------------------------
+    def _create_item_widget(self, item: PluginItem) -> Optional[QWidget]:
+        """
+        Build and wire up the concrete Qt widget for one ``PluginItem``.
+
+        Every widget's change signal is connected so it re-emits this box's
+        generic ``valueChanged(key, value)`` signal, letting callers observe
+        all controls uniformly without caring about the underlying widget type.
+        """
+
+        # --------------------------------------------------------------
+        if item.kind == "checkbox":
+            widget = QCheckBox()
+            widget.setChecked(bool(item.default if item.default is not None else False))
+
+            widget.stateChanged.connect(
+                lambda state, key=item.key: self.valueChanged.emit(
+                    key,
+                    state == Qt.CheckState.Checked.value,
+                )
+            )
+            return widget
+
+        # --------------------------------------------------------------
+        if item.kind == "slider":
+            widget = QSlider(Qt.Orientation.Horizontal)
+
+            widget.setMinimum(int(item.minimum))
+
+            widget.setMaximum(int(item.maximum))
+
+            widget.setSingleStep(int(item.step))
+
+            value = item.default if item.default is not None else item.minimum
+
+            widget.setValue(int(value))
+
+            widget.valueChanged.connect(
+                lambda value, key=item.key: self.valueChanged.emit(
+                    key,
+                    value,
+                )
+            )
+            return widget
+
+        # --------------------------------------------------------------
+        if item.kind == "int":
+
+            widget = QSpinBox()
+            widget.setMinimum(int(item.minimum))
+            widget.setMaximum(int(item.maximum))
+            widget.setSingleStep(int(item.step))
+
+            value = item.default if item.default is not None else item.minimum
+
+            widget.setValue(int(value))
+
+            widget.valueChanged.connect(
+                lambda value, key=item.key: self.valueChanged.emit(
+                    key,
+                    value,
+                )
+            )
+            return widget
+
+        # --------------------------------------------------------------
+        if item.kind == "float":
+
+            widget = QDoubleSpinBox()
+            widget.setMinimum(float(item.minimum))
+
+            widget.setMaximum(float(item.maximum))
+
+            widget.setSingleStep(float(item.step))
+
+            widget.setDecimals(int(item.decimals))
+
+            value = item.default if item.default is not None else item.minimum
+
+            widget.setValue(float(value))
+
+            widget.valueChanged.connect(
+                lambda value, key=item.key: self.valueChanged.emit(
+                    key,
+                    value,
+                )
+            )
+            return widget
+
+        # --------------------------------------------------------------
+        if item.kind == "text":
+            widget = QLineEdit()
+            if item.default is not None:
+                widget.setText(str(item.default))
+
+            widget.textChanged.connect(
+                lambda value, key=item.key: self.valueChanged.emit(
+                    key,
+                    value,
+                )
+            )
+            return widget
+
+        return None
+
+    # ------------------------------------------------------------------
+    def get_value(self, key: str) -> Any:
+        """Read the current value of the widget registered under ``key``."""
+
+        widget = self.widgets.get(key)
+        if widget is None:
+            return None
+
+        if isinstance(widget, QCheckBox):
+            return widget.isChecked()
+
+        if isinstance(widget, QSlider):
+            return widget.value()
+
+        if isinstance(widget, QSpinBox):
+            return widget.value()
+
+        if isinstance(widget, QDoubleSpinBox):
+            return widget.value()
+
+        if isinstance(widget, QLineEdit):
+            return widget.text()
+
+        return None
+
+    # ------------------------------------------------------------------
+    def get_config(self) -> dict[str, Any]:
+        """Snapshot every item's current value into a plain dict (e.g. for saving to YAML)."""
+        cfg: dict[str, Any] = {}
+        for item in self.items:
+            if item.kind == "separator":
+                continue
+            cfg[item.key] = self.get_value(item.key)
+        return cfg
+
+    # ------------------------------------------------------------------
+    def set_config(self, config: Optional[dict[str, Any]]):
+        """Apply previously-saved values back onto the widgets (e.g. when loading a preset)."""
+        if not config:
+            return
+
+        for item in self.items:
+
+            if item.kind == "separator":
+                continue
+
+            if item.key not in config:
+                continue
+
+            value = config[item.key]
+            widget = self.widgets.get(item.key)
+
+            if widget is None:
+                continue
+
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+
+            elif isinstance(widget, QSlider):
+                widget.setValue(int(value))
+
+            elif isinstance(widget, QSpinBox):
+                widget.setValue(int(value))
+
+            elif isinstance(widget, QDoubleSpinBox):
+                widget.setValue(float(value))
+
+            elif isinstance(widget, QLineEdit):
+                widget.setText(str(value))
+
+
+# ------------------------------------------------------------------------------------------
+class BatchPlugin:
+    """
+    Abstract base class for all batch plugins.
+
+    Subclasses declare their UI via ``setUp`` (called by the registry/entry)
+    and implement whichever of ``process()`` / ``load()`` they need:
+      * ``process()`` runs the plugin's main batch action.
+      * ``load()`` runs a lighter "preview/load only" action.
+    Whether the "Process" and/or "Load" buttons are shown is decided
+    automatically in ``create_plugin_box`` based on which of these methods
+    a subclass actually overrides.
+    """
+
+    def __init__(self, context: BatchContext):
+        self.context = context
+
+    def setUp(self, key: str, title: str, items: PluginItem, columns: int = 5):
+        """Called once after construction to bind this instance to its registry entry."""
+        self.plugin_items = items
+        self.key_name = key
+        self.title = title
+        self.columns = columns
+        # Restore any previously saved settings for this plugin (empty dict if none).
+        self._config = self.context.config.get(self.key_name, {}) or {}
+        self.context.siril.log(f"setup plugin: {self.title}", LogColor.GREEN)
+
+    def create_plugin_box(self):
+        """
+        Build the ``PluginConfigBox`` widget for this plugin.
+
+        Detects whether the subclass overrides ``process``/``load`` (versus
+        inheriting the no-op default) to decide which action buttons to show,
+        and wires those buttons to ``_on_process``/``_on_load``.
+        """
+        has_process = type(self).process is not BatchPlugin.process
+        has_load = type(self).load is not BatchPlugin.load
+
+        self.box = PluginConfigBox(
+            self.title,
+            self.plugin_items,
+            has_load=has_load,
+            has_process=has_process,
+            columns=self.columns,
+        )
+
+        if has_process:
+            self.box.processRequested.connect(self._on_process)
+        if has_load:
+            self.box.loadRequested.connect(self._on_load)
+
+        return self.box
+
+    def cmd(self, *args):
+        """Run a single Siril command, logging it first."""
+        self.context.siril.log(f"[CMD] {' '.join(args)}", LogColor.GREEN)
+        self.context.siril.cmd(*args)
+
+    def get_key_name(self):
+        """Returns the internal registry key of the plugin."""
+        return self.key_name
+
+    def get_plugin_name(self):
+        """Returns the display title of the plugin."""
+        return self.title
+
+    def _on_process(self):
+        """
+        Handler for the "Process" button: runs ``process()``, always returns
+        to the original working directory afterwards, then runs ``load()``
+        (if defined) so the result is immediately reflected in the UI.
+        """
+        workdir = self.get_siril_wd()
+        has_load = type(self).load is not BatchPlugin.load
+        try:
+            self.process()
+        except Exception as e:
+            self.context.siril.log(f"Error during execution: {e}", LogColor.RED)
+        self.cmd("cd", workdir)
+        if has_load:
+            self.load()
+
+    def _on_load(self):
+        """Handler for the "Load" button."""
+        self.load()
+
+    def process(self):
+        """Override to implement the plugin's main batch action. No-op by default."""
+        pass
+
+    def load(self):
+        """Override to implement a lightweight preview/load action. No-op by default."""
+        pass
+
+    def seril(self):
+        """Convenience accessor for the shared Siril interface."""
+        return self.context.siril
+
+    def get_siril_wd(self):
+        """Convenience accessor for Siril's current working directory."""
+        return self.context.siril.get_siril_wd()
+
+    def get_value(self, key: str):
+        """Read the current value of one of this plugin's config widgets."""
+        return self.box.get_value(key)
+
+    @property
+    def config(self):
+        """The plugin's persisted settings dict (as loaded in ``setUp``)."""
+        return self._config
+
+    @config.setter
+    def config(self, value):
+        self._config = value
+
+
+@dataclass
+class BatchPluginEntry:
+    """
+    Static metadata describing one registered plugin type, as produced by
+    ``@BatchPluginRegistry.register(...)``. This is the "blueprint"; call
+    ``instantiate()`` to get a live ``BatchPlugin`` bound to a context.
+    """
+
+    plugin_cls: Type[BatchPlugin]
+    key: str
+    title: str
+    items: "PluginItem"
+    columns: int = 5
+    enabled: bool = True
+
+    def instantiate(self, context: BatchContext) -> BatchPlugin:
+        """Create and set up a fresh plugin instance from this entry."""
+        instance = self.plugin_cls(context)
+        instance.setUp(
+            key=self.key,
+            title=self.title,
+            items=self.items,
+            columns=self.columns,
+        )
+        return instance
+
+
+class BatchPluginRegistry:
+    """
+    Global registry of all available plugin types.
+
+    Plugin modules register themselves with the ``@BatchPluginRegistry.register(...)``
+    class decorator at import time (see ``load_plugins``), so simply importing a
+    plugin module is enough to make it available in the UI.
+    """
+
+    _entries: list[BatchPluginEntry] = []
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def register(
+        cls, key: str, title: str, items: "PluginItem", columns: int = 5, enabled: bool = True
+    ):
+        """Class decorator: wraps a ``BatchPlugin`` subclass and registers its metadata."""
+
+        def decorator(plugin_cls: Type[BatchPlugin]):
+            cls._entries.append(
+                BatchPluginEntry(
+                    plugin_cls=plugin_cls,
+                    key=key,
+                    title=title,
+                    items=items,
+                    columns=columns,
+                    enabled=enabled,
+                )
+            )
+            return plugin_cls
+
+        return decorator
+
+    @classmethod
+    def all(cls) -> list[BatchPluginEntry]:
+        """Return every registered plugin entry (enabled or not)."""
+        return cls._entries
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def get(
+        cls,
+        key: str,
+    ) -> Optional[BatchPluginEntry]:
+        """Look up a registered entry by its key, or None if not found."""
+
+        for entry in cls._entries:
+
+            if entry.key == key:
+                return entry
+
+        return None
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def clear(cls):
+        """Remove all registered entries (mainly useful for tests)."""
+        cls._entries.clear()
+
+
+@dataclass
+class BatchPluginInstance:
+    """
+    A live plugin placed into the batch by the user, pairing its static
+    ``entry`` with the running ``instance``, the ``widget`` (its config box),
+    and the ``row`` container widget that holds both the box and its
+    up/down/remove buttons inside ``PluginContainer``.
+    """
+
+    entry: BatchPluginEntry
+    instance: BatchPlugin
+    widget: PluginConfigBox
+    row: Optional[QWidget] = None
+
+
+class PluginContainer(QWidget):
+    """
+    Drop target and vertical list manager for the plugins the user has added
+    to the current batch.
+
+    Plugins are dragged in from ``PluginList`` (identified by their registry
+    key via Qt's mime data) and rendered as a stack of rows, each pairing a
+    plugin's ``PluginConfigBox`` with up/down/remove controls. Row widgets are
+    created once per instance and reused across reordering; see the notes on
+    ``_rebuild_layout`` for why.
+    """
+
+    def __init__(
+        self,
+        registry: BatchPluginRegistry,
+        context: BatchContext,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+
+        self.registry = registry
+        self.context = context
+
+        self.instances: list[BatchPluginInstance] = []
+
+        self.setAcceptDrops(True)
+
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(8, 8, 8, 8)
+        self.layout.setSpacing(2)  # tight vertical gap between stacked plugin rows
+        self.layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self._empty_label: Optional[QLabel] = None
+
+        self._show_empty_label()
+
+    # ==================================================================
+    # EMPTY STATE
+    # ==================================================================
+
+    def _show_empty_label(self):
+        """Show the "Drag a plugin here" placeholder (no-op if already shown)."""
+
+        if self._empty_label is not None:
+            return
+
+        self._empty_label = QLabel("Drag a plugin here")
+
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._empty_label.setMinimumHeight(100)
+
+        self.layout.addWidget(self._empty_label)
+
+    # ------------------------------------------------------------------
+
+    def _remove_empty_label(self):
+        """Remove the "Drag a plugin here" placeholder, if currently shown."""
+
+        if self._empty_label is None:
+            return
+
+        self.layout.removeWidget(self._empty_label)
+
+        self._empty_label.deleteLater()
+
+        self._empty_label = None
+
+    # ==================================================================
+    # DRAG & DROP
+    # ==================================================================
+
+    def dragEnterEvent(self, event):
+        """Accept the drag only if it carries a plugin key known to the registry."""
+
+        if not event.mimeData().hasText():
+            event.ignore()
+            return
+
+        key = event.mimeData().text()
+
+        entry = self.registry.get(key)
+
+        if entry is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    # ------------------------------------------------------------------
+
+    def dragMoveEvent(self, event):
+        """Same acceptance check as dragEnterEvent, re-run as the drag moves over us."""
+
+        if not event.mimeData().hasText():
+            event.ignore()
+            return
+
+        key = event.mimeData().text()
+
+        entry = self.registry.get(key)
+
+        if entry is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    # ------------------------------------------------------------------
+
+    def dropEvent(self, event):
+        """Resolve the dropped plugin key against the registry and add it to the batch."""
+
+        if not event.mimeData().hasText():
+            event.ignore()
+            return
+
+        key = event.mimeData().text()
+
+        entry = self.registry.get(key)
+
+        if entry is None:
+            event.ignore()
+            return
+
+        instance = self.add_plugin(entry)
+
+        if instance is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    # ==================================================================
+    # ADD PLUGIN
+    # ==================================================================
+
+    def add_plugin(
+        self,
+        entry: BatchPluginEntry,
+        config: Optional[dict] = None,
+    ) -> Optional[BatchPluginInstance]:
+        """
+        Instantiate ``entry``, build its config box, wrap it in a row with
+        move/remove buttons, and append it to the batch.
+
+        Returns None (and logs the reason) if the plugin is already present
+        or if instantiation fails, so callers can react without a partially
+        set up instance being added.
+        """
+
+        # --------------------------------------------------------------
+        # Prevent duplicate plugins
+        # --------------------------------------------------------------
+
+        for existing in self.instances:
+
+            if existing.entry.key == entry.key:
+
+                self.context.siril.log(
+                    f"Plugin already added: {entry.title}",
+                    LogColor.RED,
+                )
+
+                return None
+
+        # --------------------------------------------------------------
+        # Create plugin instance
+        # --------------------------------------------------------------
+
+        try:
+
+            plugin = entry.plugin_cls(self.context)
+
+            plugin.setUp(
+                key=entry.key,
+                title=entry.title,
+                items=entry.items,
+                columns=entry.columns,
+            )
+
+            widget = plugin.create_plugin_box()
+
+            # Restore saved configuration
+            if config is not None:
+                widget.set_config(config)
+
+        except Exception as e:
+
+            self.context.siril.log(
+                f"Error creating plugin " f"{entry.title}: {e}",
+                LogColor.RED,
+            )
+
+            return None
+
+        # --------------------------------------------------------------
+        # Create instance
+        #
+        # The row is created ONCE and stored in the instance.
+        # This is important.
+        # --------------------------------------------------------------
+
+        instance = BatchPluginInstance(
+            entry=entry,
+            instance=plugin,
+            widget=widget,
+            row=None,
+        )
+
+        # --------------------------------------------------------------
+        # Create row
+        # --------------------------------------------------------------
+
+        row = self._create_plugin_row(instance)
+
+        instance.row = row
+
+        # --------------------------------------------------------------
+        # Store instance
+        # --------------------------------------------------------------
+
+        self.instances.append(instance)
+
+        # --------------------------------------------------------------
+        # Update layout
+        # --------------------------------------------------------------
+
+        self._remove_empty_label()
+
+        self.layout.addWidget(row)
+
+        self.context.siril.log(
+            f"Added plugin: {entry.title}",
+            LogColor.GREEN,
+        )
+
+        return instance
+
+    # ==================================================================
+    # CREATE PLUGIN ROW
+    # ==================================================================
+
+    def _create_plugin_row(
+        self,
+        instance: BatchPluginInstance,
+    ) -> QWidget:
+        """Build the row widget: the plugin's config box plus a column of ▲ / ▼ / ✕ buttons."""
+
+        row = QWidget()
+
+        row_layout = QHBoxLayout(row)
+
+        row_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        row_layout.setSpacing(6)
+
+        # --------------------------------------------------------------
+        # Plugin configuration box
+        # --------------------------------------------------------------
+
+        row_layout.addWidget(
+            instance.widget,
+            1,
+        )
+
+        # --------------------------------------------------------------
+        # Buttons
+        # --------------------------------------------------------------
+
+        button_layout = QVBoxLayout()
+
+        button_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        button_layout.setSpacing(2)
+
+        up_button = QPushButton("▲")
+        down_button = QPushButton("▼")
+        remove_button = QPushButton("✕")
+
+        up_button.setFixedSize(
+            32,
+            28,
+        )
+
+        down_button.setFixedSize(
+            32,
+            28,
+        )
+
+        remove_button.setFixedSize(
+            32,
+            28,
+        )
+
+        up_button.setToolTip("Move plugin up")
+
+        down_button.setToolTip("Move plugin down")
+
+        remove_button.setToolTip("Remove plugin")
+
+        button_layout.addWidget(up_button)
+
+        button_layout.addWidget(down_button)
+
+        button_layout.addWidget(remove_button)
+
+        button_layout.addStretch()
+
+        row_layout.addLayout(button_layout)
+
+        # --------------------------------------------------------------
+        # IMPORTANT:
+        #
+        # Connect to the actual instance rather than storing an index.
+        #
+        # This means the buttons continue to work correctly after
+        # plugins are reordered.
+        # --------------------------------------------------------------
+
+        up_button.clicked.connect(lambda checked=False, obj=instance: self._move_instance_up(obj))
+
+        down_button.clicked.connect(
+            lambda checked=False, obj=instance: self._move_instance_down(obj)
+        )
+
+        remove_button.clicked.connect(
+            lambda checked=False, obj=instance: self._remove_instance(obj)
+        )
+
+        return row
+
+    # ==================================================================
+    # MOVE PLUGIN UP
+    # ==================================================================
+
+    def _move_instance_up(
+        self,
+        instance: BatchPluginInstance,
+    ):
+        """Swap ``instance`` with its predecessor in the list, then redraw the stack."""
+
+        if instance not in self.instances:
+            return
+
+        index = self.instances.index(instance)
+
+        if index <= 0:
+            return
+
+        # Swap the instances
+        self.instances[index - 1], self.instances[index] = (
+            self.instances[index],
+            self.instances[index - 1],
+        )
+
+        self._rebuild_layout()
+
+    # ==================================================================
+    # MOVE PLUGIN DOWN
+    # ==================================================================
+
+    def _move_instance_down(
+        self,
+        instance: BatchPluginInstance,
+    ):
+        """Swap ``instance`` with its successor in the list, then redraw the stack."""
+
+        if instance not in self.instances:
+            return
+
+        index = self.instances.index(instance)
+
+        if index >= len(self.instances) - 1:
+            return
+
+        # Swap the instances
+        self.instances[index + 1], self.instances[index] = (
+            self.instances[index],
+            self.instances[index + 1],
+        )
+
+        self._rebuild_layout()
+
+    # ==================================================================
+    # REMOVE PLUGIN
+    # ==================================================================
+
+    def _remove_instance(
+        self,
+        instance: BatchPluginInstance,
+    ):
+        """Drop ``instance`` from the batch and delete its row widget."""
+
+        if instance not in self.instances:
+            return
+
+        self.instances.remove(instance)
+
+        # --------------------------------------------------------------
+        # Delete the ROW, not the PluginConfigBox directly.
+        #
+        # The PluginConfigBox belongs to the row.
+        # --------------------------------------------------------------
+
+        if instance.row is not None:
+
+            self.layout.removeWidget(instance.row)
+
+            instance.row.deleteLater()
+
+            instance.row = None
+
+        # --------------------------------------------------------------
+        # Show empty state when no plugins remain
+        # --------------------------------------------------------------
+
+        if not self.instances:
+
+            self._show_empty_label()
+
+    # ==================================================================
+    # REBUILD LAYOUT
+    # ==================================================================
+
+    def _rebuild_layout(self):
+
+        # --------------------------------------------------------------
+        # IMPORTANT:
+        #
+        # We only remove the ROW widgets from the layout.
+        #
+        # We NEVER call:
+        #
+        #     instance.widget.setParent(None)
+        #
+        # and we NEVER call:
+        #
+        #     instance.widget.deleteLater()
+        #
+        # while reordering.
+        #
+        # The PluginConfigBox stays alive inside its row.
+        # --------------------------------------------------------------
+
+        while self.layout.count():
+
+            item = self.layout.takeAt(0)
+
+            widget = item.widget()
+
+            if widget is None:
+                continue
+
+            # Do not delete the widgets.
+            #
+            # They are going to be added back below.
+
+        # --------------------------------------------------------------
+        # Re-add plugins in their current order
+        # --------------------------------------------------------------
+
+        for instance in self.instances:
+
+            if instance.row is not None:
+
+                self.layout.addWidget(instance.row)
+
+        # --------------------------------------------------------------
+        # Keep the layout packed at the top
+        # --------------------------------------------------------------
+
+        self.layout.addStretch()
+
+    # ==================================================================
+    # GET PLUGIN ORDER
+    # ==================================================================
+
+    def get_plugin_order(self) -> list[str]:
+        """Return the registry keys of the current plugins, in their displayed order."""
+
+        return [instance.entry.key for instance in self.instances]
+
+    # ==================================================================
+    # GET CONFIGURATION
+    # ==================================================================
+
+    def get_config(self) -> list[dict]:
+        """Serialize the whole batch (order + each plugin's settings) for saving."""
+
+        result = []
+
+        for instance in self.instances:
+
+            result.append(
+                {
+                    "key": instance.entry.key,
+                    "config": instance.widget.get_config(),
+                }
+            )
+
+        return result
+
+    # ==================================================================
+    # CLEAR ALL PLUGINS
+    # ==================================================================
+
+    def clear_plugins(self):
+        """Remove every plugin from the batch and show the empty-state placeholder again."""
+
+        # --------------------------------------------------------------
+        # Remove and delete each row.
+        #
+        # Deleting the row also deletes the PluginConfigBox contained
+        # inside that row.
+        # --------------------------------------------------------------
+
+        for instance in self.instances:
+
+            if instance.row is not None:
+
+                self.layout.removeWidget(instance.row)
+
+                instance.row.deleteLater()
+
+                instance.row = None
+
+        # --------------------------------------------------------------
+        # Clear instance list
+        # --------------------------------------------------------------
+
+        self.instances.clear()
+
+        # --------------------------------------------------------------
+        # Remove empty label if it exists
+        # --------------------------------------------------------------
+
+        if self._empty_label is not None:
+
+            self.layout.removeWidget(self._empty_label)
+
+            self._empty_label.deleteLater()
+
+            self._empty_label = None
+
+        # --------------------------------------------------------------
+        # Show empty state
+        # --------------------------------------------------------------
+
+        self._show_empty_label()
+
+    # ==================================================================
+    # LOAD CONFIGURATION
+    # ==================================================================
+
+    def load_config(
+        self,
+        plugins_config: list[dict],
+    ):
+        """Replace the current batch with the plugins described by ``plugins_config``
+        (the same shape produced by ``get_config``)."""
+
+        # --------------------------------------------------------------
+        # Remove current plugins
+        # --------------------------------------------------------------
+
+        self.clear_plugins()
+
+        if not plugins_config:
+            return
+
+        # --------------------------------------------------------------
+        # Restore plugins
+        # --------------------------------------------------------------
+
+        for plugin_data in plugins_config:
+
+            if not isinstance(
+                plugin_data,
+                dict,
+            ):
+                continue
+
+            key = plugin_data.get("key")
+
+            if not key:
+                continue
+
+            entry = self.registry.get(key)
+
+            if entry is None:
+
+                self.context.siril.log(
+                    f"Plugin not found: {key}",
+                    LogColor.RED,
+                )
+
+                continue
+
+            config = plugin_data.get(
+                "config",
+                {},
+            )
+
+            self.add_plugin(
+                entry,
+                config=config,
+            )
+
+
+class PluginList(QListWidget):
+    """
+    Sidebar list of available (enabled) plugins that the user can drag into
+    the ``PluginContainer`` to add them to the batch.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+
+        self.setDragEnabled(True)
+        self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.setAlternatingRowColors(True)
+
+    def populate(self, plugins: list[BatchPluginEntry]):
+        """Refill the list from the registry, skipping disabled entries."""
+        self.clear()
+        for plugin in plugins:
+            if not plugin.enabled:
+                continue
+
+            item = QListWidgetItem(plugin.title)
+            item.setData(Qt.ItemDataRole.UserRole, plugin.key)
+            item.setToolTip(plugin.key)
+            self.addItem(item)
+
+    def startDrag(self, supportedActions):
+        """Begin a drag carrying the selected plugin's registry key as plain text."""
+
+        item = self.currentItem()
+        if item is None:
+            return
+
+        plugin_key = item.data(Qt.ItemDataRole.UserRole)
+
+        if not plugin_key:
+            return
+
+        mime_data = QMimeData()
+        mime_data.setText(str(plugin_key))
+
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+
+        # Small drag icon
+        pixmap = QPixmap(160, 32)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        drag.setPixmap(pixmap)
+        drag.exec(Qt.DropAction.CopyAction)
+
+
+class Batch(QMainWindow):
+    """Main application window: connects to Siril, loads config, and builds the UI."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.siril = self.connect_to_siril()
+        self.siril.log(f"read config", LogColor.GREEN)
+
+        self.config = BatchConfig(self.siril)
+        self.presets = self.config.readPresetConfig()
+        # Load the plugins
+        self.siril.log(f"load plugins", LogColor.GREEN)
+        self.context = BatchContext(siril=self.siril, config=self.presets)
+
+        self.createWindow()
+
+        self.initialization_successful = True
+
+    def connect_to_siril(self):
+        """Establish the connection to the running Siril instance."""
+        try:
+            siril = s.SirilInterface()
+            siril.connect()
+            siril.log("Connected to Siril", LogColor.GREEN)
+            return siril
+        except Exception as e:
+            siril.log("Failed to connect to Siril", LogColor.RED)
+            self.close_dialog()
+
+    def createWindow(self):
+        """Build the main layout: info panel, plugin sidebar, drop-target batch area, footer."""
+        self.setWindowTitle(f"{APP_NAME} - v{VERSION}")
+        self.resize(900, 600)
+
+        central = QWidget()
+
+        self.setCentralWidget(central)
+
+        main_layout = QVBoxLayout(central)
+        content_layout = QHBoxLayout()
+
+        info_box = QGroupBox()
+        info_layout = QVBoxLayout(info_box)
+        info_label = QLabel("Information")
+        info_layout.addWidget(info_label)
+
+        workdir = self.siril.get_siril_wd()
+        cwd_label = QLabel(f"Current Working Directory: {workdir}")
+        cwd_label.setWordWrap(True)
+        info_layout.addWidget(cwd_label)
+
+        main_layout.addWidget(info_box)
+        # --------------------------------------------------------------------
+        # Plugin List
+        # --------------------------------------------------------------------
+        left_layout = QVBoxLayout()
+        left_label = QLabel("Available Plugins")
+        left_layout.addWidget(left_label)
+        self.plugin_list = PluginList()
+        self.plugin_list.populate(BatchPluginRegistry.all())
+        left_layout.addWidget(self.plugin_list)
+        content_layout.addLayout(left_layout, 1)
+
+        # --------------------------------------------------------------------
+        # CENTER
+        # --------------------------------------------------------------------
+        center_layout = QVBoxLayout()
+        center_label = QLabel("Batch Processing")
+
+        center_layout.addWidget(center_label)
+        # Scroll area
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setAcceptDrops(True)
+        # Plugin container
+        self.plugin_container = PluginContainer(registry=BatchPluginRegistry, context=self.context)
+
+        self.scroll_area.setWidget(self.plugin_container)
+        center_layout.addWidget(self.scroll_area)
+        content_layout.addLayout(center_layout, 3)
+
+        main_layout.addLayout(content_layout, 1)
+        # --------------------------------------------------------------------
+        # Footer
+        # --------------------------------------------------------------------
+
+        main_layout.addLayout(self._create_buttons_layout())
+
+    def _create_buttons_layout(self):
+        """Build the footer button row (Save/Load Presets, Close, Run)."""
+        footer = QHBoxLayout()
+        footer.setContentsMargins(12, 10, 12, 12)
+        footer.setSpacing(8)
+
+        #        help_button = QPushButton("Help")
+        #        help_button.setMinimumWidth(50)
+        #        help_button.setMinimumHeight(35)
+        #        help_button.setToolTip("Show help information and frequently asked questions")
+        #        help_button.clicked.connect(self.show_help)
+        #        button_layout.addWidget(help_button)
+
+        save_presets_button = QPushButton("Save Presets")
+        save_presets_button.setMinimumWidth(80)
+        save_presets_button.setMinimumHeight(35)
+        save_presets_button.setToolTip(
+            'Save current settings to a "naztronomy_smart_scope_presets.json" file in the presets directory'
+        )
+        #        save_presets_button.clicked.connect(self.save_presets)
+        footer.addWidget(save_presets_button)
+
+        load_presets_button = QPushButton("Load Presets")
+        load_presets_button.setMinimumWidth(80)
+        load_presets_button.setMinimumHeight(35)
+        load_presets_button.setToolTip(
+            'Load previously saved presets. If "presets/naztronomy_smart_scope_presets.json" exists, it will load first, otherwise it\'ll prompt you to find a proper .json file.'
+        )
+        #        load_presets_button.clicked.connect(self.load_presets)
+        footer.addWidget(load_presets_button)
+
+        #       button_layout.addStretch()
+
+        close_button = QPushButton("Close")
+        close_button.setMinimumWidth(100)
+        close_button.setMinimumHeight(35)
+        close_button.setStyleSheet(
+            "QPushButton { background-color: #c70306; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #fc3437; }"
+        )
+        close_button.clicked.connect(self.close_dialog)
+        footer.addWidget(close_button)
+
+        footer.addSpacing(10)
+
+        self.run_button = QPushButton("Run")
+        self.run_button.setMinimumWidth(100)
+        self.run_button.setMinimumHeight(35)
+        self.run_button.setStyleSheet(
+            "QPushButton { background-color: #0078cc; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #33abff; }"
+        )
+        #        self.run_button.clicked.connect(self.on_run_clicked)
+        footer.addWidget(self.run_button)
+
+        return footer
+
+    def close_dialog(self):
+        """Disconnect from Siril and close the window."""
+        self.siril.disconnect()
+        self.close()
+
+
+def load_plugins(plugin_dir: str) -> None:
+    """
+    Import every ``.py`` module in the plugins package (skipping files
+    starting with "_", e.g. ``__init__.py``).
+
+    Importing is enough to register a plugin: each module's
+    ``@BatchPluginRegistry.register(...)``-decorated class runs its
+    decorator as a side effect of the import, populating
+    ``BatchPluginRegistry._entries``.
+    """
+    plugin_path = pathlib.Path(plugin_dir)
+    print(f"{plugin_path.absolute()}")
+    for file in plugin_path.glob("*.py"):
+        if file.stem.startswith("_"):
+            continue  # e.g. skip __init__.py
+        print(f"load {file.name}")
+        spec = importlib.util.spec_from_file_location(file.stem, file)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+
+def sirilBatch(argv):
+    """Application entry point: load plugins, build the Qt app, and run the main window."""
+    try:
+        plugin = os.path.dirname(os.path.realpath(__file__)) + "/plugins"
+        load_plugins(plugin)
+
+        app = QApplication(argv)
+        batch = Batch()
+
+        # Only show window if initialization was successful
+        if batch.initialization_successful:
+            batch.show()
+            sys.exit(app.exec())
+        else:
+            # User canceled during initialization - exit gracefully
+            sys.exit(0)
+    except Exception as e:
+        print(f"Error initializing application: {str(e)}")
+        sys.exit(1)
