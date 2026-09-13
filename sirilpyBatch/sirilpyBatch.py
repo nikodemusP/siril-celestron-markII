@@ -72,22 +72,26 @@ class BatchConfig:
     Two separate files are involved:
       * ``config.yaml``               - per-project settings, stored in the current
                                          Siril working directory (created on first use).
+      * ``origin_m2_presets.yaml``    - user-wide presets, stored in Siril's user data
+                                         directory so they survive across projects.
     """
 
     def __init__(self, siril):
         self.siril = siril
+        # Directory of the currently open Siril project (per-project config lives here).
+        self.workDir = siril.get_siril_wd()
         # Siril's persistent per-user data directory (presets live here).
-        self.config_Dir = siril.get_siril_userdatadir()
+        config_Dir = siril.get_siril_userdatadir()
+        self.presets_file = Path(config_Dir) / "sirilpyBatch.yaml" 
 
     def readPresetConfig(self):
         """Load the user-wide presets file, or None if it doesn't exist yet / fails to parse."""
         self.siril.log(f"read preset config", LogColor.GREEN)
-        presets_file = Path(self.config_Dir) / "origin_m2_presets.yaml"
-        if not presets_file.exists():
-            self.siril.log("Presets file not found: orgin_m2_presets.yaml", LogColor.RED)
+        if not self.presets_file.exists():
+            self.siril.log("Presets file not found: sirilpyBatch.yaml", LogColor.RED)
             return None
         try:
-            with open(presets_file, "r") as f:
+            with open(self.presets_file, "r") as f:
                 presets = yaml.safe_load(f)
                 self.siril.log("Presets loaded successfully.", LogColor.GREEN)
                 return presets
@@ -96,10 +100,9 @@ class BatchConfig:
             return None
 
     def storePresets(self, config):
-        """Persist the user-wide presets dict to ``origin_m2_presets.yaml``."""
-        presets_file = Path(self.config_Dir) / "origin_m2_presets.yaml"
+        """Persist the user-wide presets dict to ``sirilpyBatch.yaml``."""
         try:
-            with open(presets_file, "w") as f:
+            with open(self.presets_file, "w") as f:
                 yaml.dump(config, f)
                 self.siril.log("Configuration saved successfully.", LogColor.GREEN)
         except Exception as e:
@@ -180,11 +183,6 @@ class PluginConfigBox(QGroupBox):
 
         # Maps PluginItem.key -> the live Qt widget holding that item's value.
         self.widgets: dict[str, QWidget] = {}
-
-        # The box itself is checkable; its checked state is the plugin's "active" flag.
-        self.setCheckable(True)
-        self.setChecked(True)
-
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
 
         self._create_ui(has_load=has_load, has_process=has_process)
@@ -216,64 +214,65 @@ class PluginConfigBox(QGroupBox):
         row = 0
         column = 0
 
-        for item in self.items:
-            if item.kind == "separator":
-                # Start the separator on its own row, even if the current
-                # row isn't full yet.
-                if column != 0:
+        if self.items:
+            for item in self.items:
+                if item.kind == "separator":
+                    # Start the separator on its own row, even if the current
+                    # row isn't full yet.
+                    if column != 0:
+                        row += 1
+                        column = 0
+
+                    line = QLabel()
+                    line.setFixedHeight(1)
+
+                    grid.addWidget(line, row, 0, 1, self.columns)
+
                     row += 1
+                    continue
+
+                widget = self._create_item_widget(item)
+
+                if widget is None:
+                    continue
+
+                # Clamp the requested span to a sane range and wrap to a fresh
+                # row first if it wouldn't fit in the remaining columns.
+                span = max(1, min(item.colspan, self.columns))
+                if column + span > self.columns:
                     column = 0
+                    row += 1
 
-                line = QLabel()
-                line.setFixedHeight(1)
+                # Each cell is its own little "label beside widget" mini-layout.
+                label = QLabel(item.label)
+                if item.tooltip:
+                    label.setToolTip(item.tooltip)
+                    widget.setToolTip(item.tooltip)
 
-                grid.addWidget(line, row, 0, 1, self.columns)
+                # Label and widget side by side on one line.
+                cell = QHBoxLayout()
+                cell.setContentsMargins(0, 0, 0, 0)
+                cell.setSpacing(6)
 
-                row += 1
-                continue
+                label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+                widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-            widget = self._create_item_widget(item)
+                cell.addWidget(label)
+                cell.addWidget(widget, 1)
 
-            if widget is None:
-                continue
+                container = QWidget()
+                container.setLayout(cell)
 
-            # Clamp the requested span to a sane range and wrap to a fresh
-            # row first if it wouldn't fit in the remaining columns.
-            span = max(1, min(item.colspan, self.columns))
-            if column + span > self.columns:
-                column = 0
-                row += 1
+                grid.addWidget(container, row, column, 1, span)
+                self.widgets[item.key] = widget
 
-            # Each cell is its own little "label beside widget" mini-layout.
-            label = QLabel(item.label)
-            if item.tooltip:
-                label.setToolTip(item.tooltip)
-                widget.setToolTip(item.tooltip)
+                # Advance past the cell(s) just used, wrapping to a new row when full.
+                column += span
+                if column >= self.columns:
+                    column = 0
+                    row += 1
 
-            # Label and widget side by side on one line.
-            cell = QHBoxLayout()
-            cell.setContentsMargins(0, 0, 0, 0)
-            cell.setSpacing(6)
-
-            label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
-            widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-            cell.addWidget(label)
-            cell.addWidget(widget, 1)
-
-            container = QWidget()
-            container.setLayout(cell)
-
-            grid.addWidget(container, row, column, 1, span)
-            self.widgets[item.key] = widget
-
-            # Advance past the cell(s) just used, wrapping to a new row when full.
-            column += span
-            if column >= self.columns:
-                column = 0
-                row += 1
-
-        main_layout.addLayout(grid)
+            main_layout.addLayout(grid)
 
         # Optional footer row with Load/Process buttons, right-aligned.
         buttons = QHBoxLayout()
@@ -472,7 +471,7 @@ class BatchPlugin:
     """
     Abstract base class for all batch plugins.
 
-    Subclasses declare their UI via ``setUp`` (called by the registry/entry)
+    Subclasses declare their UI via ``set_Up`` (called by the registry/entry)
     and implement whichever of ``process()`` / ``load()`` they need:
       * ``process()`` runs the plugin's main batch action.
       * ``load()`` runs a lighter "preview/load only" action.
@@ -481,17 +480,15 @@ class BatchPlugin:
     a subclass actually overrides.
     """
 
-    def __init__(self, context: BatchContext):
-        self.context = context
+    def __init__(self, siril: Any, config: dict ):
+        self.context = BatchContext(siril,config)
 
-    def setUp(self, key: str, title: str, items: PluginItem, columns: int = 5):
+    def set_up(self, key: str, title: str, items: PluginItem, columns: int = 5):
         """Called once after construction to bind this instance to its registry entry."""
         self.plugin_items = items
         self.key_name = key
         self.title = title
         self.columns = columns
-        # Restore any previously saved settings for this plugin (empty dict if none).
-        self._config = self.context.config.get(self.key_name, {}) or {}
         self.context.siril.log(f"setup plugin: {self.title}", LogColor.GREEN)
 
     def create_plugin_box(self):
@@ -575,12 +572,12 @@ class BatchPlugin:
 
     @property
     def config(self):
-        """The plugin's persisted settings dict (as loaded in ``setUp``)."""
-        return self._config
+        """The plugin's persisted settings dict (as loaded in ``set_up``)."""
+        return self.context.config
 
     @config.setter
     def config(self, value):
-        self._config = value
+        self.context.config = value
 
 
 @dataclass
@@ -598,10 +595,10 @@ class BatchPluginEntry:
     columns: int = 5
     enabled: bool = True
 
-    def instantiate(self, context: BatchContext) -> BatchPlugin:
+    def instantiate(self, siril: Any, config: dict) -> BatchPlugin:
         """Create and set up a fresh plugin instance from this entry."""
-        instance = self.plugin_cls(context)
-        instance.setUp(
+        instance = self.plugin_cls(siril,config)
+        instance.set_up(
             key=self.key,
             title=self.title,
             items=self.items,
@@ -700,14 +697,13 @@ class PluginContainer(QWidget):
     def __init__(
         self,
         registry: BatchPluginRegistry,
-        context: BatchContext,
+        siril: Any,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
 
         self.registry = registry
-        self.context = context
-
+        self.siril = siril
         self.instances: list[BatchPluginInstance] = []
 
         self.setAcceptDrops(True)
@@ -792,7 +788,6 @@ class PluginContainer(QWidget):
             event.ignore()
 
     # ------------------------------------------------------------------
-
     def dropEvent(self, event):
         """Resolve the dropped plugin key against the registry and add it to the batch."""
 
@@ -818,12 +813,7 @@ class PluginContainer(QWidget):
     # ==================================================================
     # ADD PLUGIN
     # ==================================================================
-
-    def add_plugin(
-        self,
-        entry: BatchPluginEntry,
-        config: Optional[dict] = None,
-    ) -> Optional[BatchPluginInstance]:
+    def add_plugin( self, entry: BatchPluginEntry, config: Optional[dict] = None ) -> Optional[BatchPluginInstance]:
         """
         Instantiate ``entry``, build its config box, wrap it in a row with
         move/remove buttons, and append it to the batch.
@@ -841,7 +831,7 @@ class PluginContainer(QWidget):
 
             if existing.entry.key == entry.key:
 
-                self.context.siril.log(
+                self.siril.log(
                     f"Plugin already added: {entry.title}",
                     LogColor.RED,
                 )
@@ -853,17 +843,21 @@ class PluginContainer(QWidget):
         # --------------------------------------------------------------
 
         try:
+            print("Init plugin")
+            plugin = entry.plugin_cls(self.siril, config)
 
-            plugin = entry.plugin_cls(self.context)
-
-            plugin.setUp(
+            print("setup plugin")
+            plugin.set_up(
                 key=entry.key,
                 title=entry.title,
                 items=entry.items,
                 columns=entry.columns,
             )
 
+            print("create box")
             widget = plugin.create_plugin_box()
+
+            print("set config")
 
             # Restore saved configuration
             if config is not None:
@@ -871,7 +865,7 @@ class PluginContainer(QWidget):
 
         except Exception as e:
 
-            self.context.siril.log(
+            self.siril.log(
                 f"Error creating plugin " f"{entry.title}: {e}",
                 LogColor.RED,
             )
@@ -914,7 +908,7 @@ class PluginContainer(QWidget):
 
         self.layout.addWidget(row)
 
-        self.context.siril.log(
+        self.siril.log(
             f"Added plugin: {entry.title}",
             LogColor.GREEN,
         )
@@ -1284,7 +1278,7 @@ class PluginContainer(QWidget):
 
             if entry is None:
 
-                self.context.siril.log(
+                self.siril.log(
                     f"Plugin not found: {key}",
                     LogColor.RED,
                 )
@@ -1359,15 +1353,12 @@ class Batch(QMainWindow):
         super().__init__(parent)
         self.siril = self.connect_to_siril()
         self.siril.log(f"read config", LogColor.GREEN)
-
         self.config = BatchConfig(self.siril)
         self.presets = self.config.readPresetConfig()
         # Load the plugins
         self.siril.log(f"load plugins", LogColor.GREEN)
-        self.context = BatchContext(siril=self.siril, config=self.presets)
-
+        
         self.createWindow()
-
         self.initialization_successful = True
 
     def connect_to_siril(self):
@@ -1408,6 +1399,17 @@ class Batch(QMainWindow):
         # Plugin List
         # --------------------------------------------------------------------
         left_layout = QVBoxLayout()
+
+        batch_label = QLabel("Batch")
+        left_layout.addWidget(batch_label)
+        self.batch_combo = QComboBox()
+        self.batch_combo.setEditable(True)
+        # We add new names ourselves (in _save_current_batch); don't let Qt
+        # silently insert whatever the user is currently typing.
+        self.batch_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._populate_batch_combo()
+        left_layout.addWidget(self.batch_combo)
+
         left_label = QLabel("Available Plugins")
         left_layout.addWidget(left_label)
         self.plugin_list = PluginList()
@@ -1427,18 +1429,139 @@ class Batch(QMainWindow):
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setAcceptDrops(True)
         # Plugin container
-        self.plugin_container = PluginContainer(registry=BatchPluginRegistry, context=self.context)
+        self.plugin_container = PluginContainer(registry=BatchPluginRegistry, siril=self.siril)
 
         self.scroll_area.setWidget(self.plugin_container)
         center_layout.addWidget(self.scroll_area)
         content_layout.addLayout(center_layout, 3)
 
         main_layout.addLayout(content_layout, 1)
+
+        # The combo needs self.plugin_container to exist before it can load a
+        # batch, so it's only wired up (and the initial selection applied)
+        # here, after both sides of the window have been built.
+        #
+        # textActivated (not currentTextChanged) fires only when the user
+        # explicitly picks an entry from the dropdown - not on every
+        # keystroke while typing a new batch name - so typing a new name
+        # never wipes out the plugin list being built for it.
+        self.batch_combo.textActivated.connect(self._on_batch_selected)
+        self._load_batch(self.batch_combo.currentText())
+
         # --------------------------------------------------------------------
         # Footer
         # --------------------------------------------------------------------
 
         main_layout.addLayout(self._create_buttons_layout())
+
+    # ------------------------------------------------------------------
+    # BATCH PRESETS (from Batches: section of origin_m2_presets.yaml)
+    # ------------------------------------------------------------------
+    def _populate_batch_combo(self):
+        """
+        Fill the batch selector with every name found under the presets
+        file's ``Batches:`` section, plus a synthetic "empty" entry
+        (selected by default) for "start with no plugins".
+        """
+        batches = self.presets.get("Batches", {}) if isinstance(self.presets, dict) else {}
+        names = [name for name in batches.keys() if name != "empty"]
+
+        self.batch_combo.addItem("empty")
+        self.batch_combo.addItems(names)
+        self.batch_combo.setCurrentText("empty")
+
+    def _on_batch_selected(self, name: str):
+        """Slot for the batch combo box: (re)build the plugin list for the chosen batch."""
+        self._load_batch(name)
+
+    def _load_batch(self, name: str):
+        """
+        Replace the current batch contents with the plugins defined for
+        preset batch ``name``, restoring each plugin's saved config values.
+
+        A batch whose value isn't a list (e.g. the "empty" batch, or any
+        placeholder value in the YAML) is treated as an empty batch.
+        """
+        self.plugin_container.clear_plugins()
+
+        batches = self.presets.get("Batches", {}) if isinstance(self.presets, dict) else {}
+        entries = batches.get(name)
+
+        if not isinstance(entries, list):
+            return
+
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+
+            plugin_key = item.get("plugin")
+            if not plugin_key:
+                continue
+
+            entry = BatchPluginRegistry.get(plugin_key)
+            if entry is None:
+                self.siril.log(
+                    f"Batch '{name}': unknown plugin '{plugin_key}'",
+                    LogColor.RED,
+                )
+                continue
+
+            # The YAML uses "config: none" for plugins that take no settings;
+            # only pass a dict through to add_plugin/set_config.
+            config = item.get("config")
+            if not isinstance(config, dict):
+                config = None
+
+            self.plugin_container.add_plugin(entry, config=config)
+
+    def _save_current_batch(self):
+        """
+        Save the current plugin list under the name shown in the batch combo.
+
+        If that name is new, it's added to the presets file (and to the
+        combo's list); if it already exists, its stored plugin list and
+        configs are overwritten with the current ones. Either way the
+        presets file is persisted to disk immediately.
+        """
+        name = self.batch_combo.currentText().strip()
+
+        if not name:
+            self.siril.log("Cannot save a batch with an empty name", LogColor.RED)
+            return
+
+        if name == "empty":
+            self.siril.log(
+                '"empty" is reserved for an empty batch and cannot be overwritten',
+                LogColor.RED,
+            )
+            return
+
+        entries = [
+            {"plugin": item["key"], "config": item["config"]}
+            for item in self.plugin_container.get_config()
+        ]
+
+        if not isinstance(self.presets, dict):
+            self.presets = {}
+        batches = self.presets.setdefault("Batches", {})
+        is_new = name not in batches
+        batches[name] = entries
+
+        self.config.storePresets(self.presets)
+
+        if is_new:
+            self.batch_combo.addItem(name)
+
+        # Reflect the (possibly new) name in the combo without re-triggering
+        # a reload - the container already holds exactly what was just saved.
+        self.batch_combo.blockSignals(True)
+        self.batch_combo.setCurrentText(name)
+        self.batch_combo.blockSignals(False)
+
+        self.siril.log(
+            f"Batch '{name}' {'created' if is_new else 'updated'} and saved",
+            LogColor.GREEN,
+        )
 
     def _create_buttons_layout(self):
         """Build the footer button row (Save/Load Presets, Close, Run)."""
@@ -1457,9 +1580,10 @@ class Batch(QMainWindow):
         save_presets_button.setMinimumWidth(80)
         save_presets_button.setMinimumHeight(35)
         save_presets_button.setToolTip(
-            'Save current settings to a "naztronomy_smart_scope_presets.json" file in the presets directory'
+            "Save the current plugin list as the batch shown in the Batch selector "
+            "(creates it if the name is new, otherwise updates it)."
         )
-        #        save_presets_button.clicked.connect(self.save_presets)
+        save_presets_button.clicked.connect(self._save_current_batch)
         footer.addWidget(save_presets_button)
 
         load_presets_button = QPushButton("Load Presets")

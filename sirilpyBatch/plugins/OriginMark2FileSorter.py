@@ -23,10 +23,7 @@ dir_config = [
     sirilFolder(fileName="dark",  targetDir="darks",  master_name="dark_master", moved=0),
     sirilFolder(fileName="flat",  targetDir="flats",  master_name="flat_master", moved=0)]
 
-sorterItems = [
-    PluginItem(key="sort_files", label="Sort Files", kind="checkbox", default=False)]
-
-@BatchPluginRegistry.register(key="sorter", title="Sort Files", items=sorterItems)
+@BatchPluginRegistry.register(key="sorter", title="Sort Files", items=None)
 class OriginMark2FileSorter(BatchPlugin):
 
     def process(self):
@@ -74,8 +71,6 @@ class OriginMark2FileSorter(BatchPlugin):
         self.context.siril.log(f"\n[FERTIG] master-files are located in masters/:", LogColor.GREEN)
         for f in sorted(masters_dir.glob("*.fits")):
             self.context.siril.log(f"         {f.name}", LogColor.GREEN)
-
-        self.config["finished"] = True
 
     # List all FiTS files in a folder
     def fits_files(self, folder: Path):
