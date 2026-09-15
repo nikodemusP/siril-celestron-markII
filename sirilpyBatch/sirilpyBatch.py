@@ -18,25 +18,22 @@ Key building blocks:
     Batch                - the main window tying everything together.
 """
 
-from abc import abstractmethod
-from dataclasses import dataclass, field
-import importlib
+from dataclasses import dataclass
+import importlib.util
 import os
-from pathlib import Path
 import pathlib
-import pkgutil
 import sys
+from pathlib import Path
 from typing import Any, Optional, Type
+
 import yaml
 import sirilpy as s
 from sirilpy import LogColor
+
 from PyQt6.QtCore import QMimeData, Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap, QDrag
 from PyQt6.QtWidgets import (
     QApplication,
-    QFormLayout,
-    QFrame,
-    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -53,11 +50,8 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QComboBox,
     QGroupBox,
-    QMessageBox,
-    QFileDialog,
     QSpinBox,
     QScrollArea,
-    QProgressBar,
 )
 
 APP_NAME = "sirilpyBatch"
@@ -78,11 +72,9 @@ class BatchConfig:
 
     def __init__(self, siril):
         self.siril = siril
-        # Directory of the currently open Siril project (per-project config lives here).
-        self.workDir = siril.get_siril_wd()
-        # Siril's persistent per-user data directory (presets live here).
-        config_Dir = siril.get_siril_userdatadir()
-        self.presets_file = Path(config_Dir) / "sirilpyBatch.yaml" 
+        config_dir = Path(siril.get_siril_userdatadir())
+        config_dir.mkdir(parents=True, exist_ok=True)
+        self.presets_file = config_dir / "sirilpyBatch.yaml"
 
     def readPresetConfig(self):
         """Load the user-wide presets file, or None if it doesn't exist yet / fails to parse."""
@@ -103,7 +95,7 @@ class BatchConfig:
         """Persist the user-wide presets dict to ``sirilpyBatch.yaml``."""
         try:
             with open(self.presets_file, "w") as f:
-                yaml.dump(config, f)
+                yaml.safe_dump(config, f)
                 self.siril.log("Configuration saved successfully.", LogColor.GREEN)
         except Exception as e:
             self.siril.log(f"Error saving configuration file: {str(e)}", LogColor.RED)
@@ -279,11 +271,15 @@ class PluginConfigBox(QGroupBox):
         buttons.addStretch()
         if has_load:
             load_button = QPushButton("Load")
+            load_button.setMinimumWidth(60)
+            load_button.setMinimumHeight(30)            
             load_button.clicked.connect(self.loadRequested.emit)
             buttons.addWidget(load_button)
 
         if has_process:
             process_button = QPushButton("Process")
+            process_button.setMinimumWidth(60)
+            process_button.setMinimumHeight(30)            
             process_button.clicked.connect(self.processRequested.emit)
             buttons.addWidget(process_button)
 
@@ -424,6 +420,9 @@ class PluginConfigBox(QGroupBox):
     def get_config(self) -> dict[str, Any]:
         """Snapshot every item's current value into a plain dict (e.g. for saving to YAML)."""
         cfg: dict[str, Any] = {}
+        if self.items == None:
+            return cfg
+        
         for item in self.items:
             if item.kind == "separator":
                 continue
@@ -481,7 +480,10 @@ class BatchPlugin:
     """
 
     def __init__(self, siril: Any, config: dict ):
-        self.context = BatchContext(siril,config)
+        self.context = BatchContext(
+            siril=siril,
+            config=config if isinstance(config, dict) else {},
+        )
 
     def set_up(self, key: str, title: str, items: PluginItem, columns: int = 5):
         """Called once after construction to bind this instance to its registry entry."""
@@ -558,7 +560,7 @@ class BatchPlugin:
         """Override to implement a lightweight preview/load action. No-op by default."""
         pass
 
-    def seril(self):
+    def siril(self):
         """Convenience accessor for the shared Siril interface."""
         return self.context.siril
 
@@ -906,7 +908,7 @@ class PluginContainer(QWidget):
 
         self._remove_empty_label()
 
-        self.layout.addWidget(row)
+        self._rebuild_layout()
 
         self.siril.log(
             f"Added plugin: {entry.title}",
@@ -916,102 +918,74 @@ class PluginContainer(QWidget):
         return instance
 
     # ==================================================================
+    # RUN THE PLUGINS
+    # ==================================================================
+    def run_plugins(self):
+        """Execute all configured plugins sequentially in their displayed order."""
+        for instance in list(self.instances):
+            self.siril.log(
+                f"Running plugin: {instance.entry.title}",
+                LogColor.GREEN,
+            )
+
+            try:
+                # Uses the same process/load behavior as the plugin's Process button.
+                instance.instance._on_process()
+            except Exception as error:
+                self.siril.log(
+                    f"Error running plugin {instance.entry.title}: {error}",
+                    LogColor.RED,
+                )
+    # ==================================================================
     # CREATE PLUGIN ROW
     # ==================================================================
-
     def _create_plugin_row(
         self,
         instance: BatchPluginInstance,
     ) -> QWidget:
-        """Build the row widget: the plugin's config box plus a column of ▲ / ▼ / ✕ buttons."""
+        """Place the plugin group box on the left and controls on the right."""
 
         row = QWidget()
-
         row_layout = QHBoxLayout(row)
-
-        row_layout.setContentsMargins(
-            0,
-            0,
-            0,
-            0,
-        )
-
+        row_layout.setContentsMargins(0, 0, 0, 0)
         row_layout.setSpacing(6)
 
-        # --------------------------------------------------------------
-        # Plugin configuration box
-        # --------------------------------------------------------------
-
+        # Group box on the left.
         row_layout.addWidget(
             instance.widget,
             1,
+            Qt.AlignmentFlag.AlignTop,
         )
 
-        # --------------------------------------------------------------
-        # Buttons
-        # --------------------------------------------------------------
-
+        # Controls on the right.
         button_layout = QVBoxLayout()
-
-        button_layout.setContentsMargins(
-            0,
-            0,
-            0,
-            0,
-        )
-
+        button_layout.setContentsMargins(0, 0, 0, 0)
         button_layout.setSpacing(2)
 
         up_button = QPushButton("▲")
         down_button = QPushButton("▼")
         remove_button = QPushButton("✕")
 
-        up_button.setFixedSize(
-            32,
-            28,
-        )
-
-        down_button.setFixedSize(
-            32,
-            28,
-        )
-
-        remove_button.setFixedSize(
-            32,
-            28,
-        )
+        for button in (up_button, down_button, remove_button):
+            button.setFixedSize(32, 28)
 
         up_button.setToolTip("Move plugin up")
-
         down_button.setToolTip("Move plugin down")
-
         remove_button.setToolTip("Remove plugin")
 
         button_layout.addWidget(up_button)
-
         button_layout.addWidget(down_button)
-
         button_layout.addWidget(remove_button)
-
         button_layout.addStretch()
 
         row_layout.addLayout(button_layout)
 
-        # --------------------------------------------------------------
-        # IMPORTANT:
-        #
-        # Connect to the actual instance rather than storing an index.
-        #
-        # This means the buttons continue to work correctly after
-        # plugins are reordered.
-        # --------------------------------------------------------------
-
-        up_button.clicked.connect(lambda checked=False, obj=instance: self._move_instance_up(obj))
-
+        up_button.clicked.connect(
+            lambda checked=False, obj=instance: self._move_instance_up(obj)
+        )
         down_button.clicked.connect(
             lambda checked=False, obj=instance: self._move_instance_down(obj)
         )
-
         remove_button.clicked.connect(
             lambda checked=False, obj=instance: self._remove_instance(obj)
         )
@@ -1112,53 +1086,21 @@ class PluginContainer(QWidget):
     # ==================================================================
 
     def _rebuild_layout(self):
-
-        # --------------------------------------------------------------
-        # IMPORTANT:
-        #
-        # We only remove the ROW widgets from the layout.
-        #
-        # We NEVER call:
-        #
-        #     instance.widget.setParent(None)
-        #
-        # and we NEVER call:
-        #
-        #     instance.widget.deleteLater()
-        #
-        # while reordering.
-        #
-        # The PluginConfigBox stays alive inside its row.
-        # --------------------------------------------------------------
+        """Rebuild the plugin rows in compact top-to-bottom order."""
 
         while self.layout.count():
-
-            item = self.layout.takeAt(0)
-
-            widget = item.widget()
-
-            if widget is None:
-                continue
-
-            # Do not delete the widgets.
-            #
-            # They are going to be added back below.
-
-        # --------------------------------------------------------------
-        # Re-add plugins in their current order
-        # --------------------------------------------------------------
+            self.layout.takeAt(0)
 
         for instance in self.instances:
-
             if instance.row is not None:
-
+                instance.row.setSizePolicy(
+                    QSizePolicy.Policy.Expanding,
+                    QSizePolicy.Policy.Maximum,
+                )
                 self.layout.addWidget(instance.row)
 
-        # --------------------------------------------------------------
-        # Keep the layout packed at the top
-        # --------------------------------------------------------------
-
-        self.layout.addStretch()
+        # Keep all rows grouped at the top; do not add a stretch item.
+        self.layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
     # ==================================================================
     # GET PLUGIN ORDER
@@ -1352,6 +1294,11 @@ class Batch(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.siril = self.connect_to_siril()
+
+        if self.siril is None:
+            self.initialization_successful = False
+            return
+        
         self.siril.log(f"read config", LogColor.GREEN)
         self.config = BatchConfig(self.siril)
         self.presets = self.config.readPresetConfig()
@@ -1359,6 +1306,7 @@ class Batch(QMainWindow):
         self.siril.log(f"load plugins", LogColor.GREEN)
         
         self.createWindow()
+
         self.initialization_successful = True
 
     def connect_to_siril(self):
@@ -1368,9 +1316,9 @@ class Batch(QMainWindow):
             siril.connect()
             siril.log("Connected to Siril", LogColor.GREEN)
             return siril
-        except Exception as e:
-            siril.log("Failed to connect to Siril", LogColor.RED)
-            self.close_dialog()
+        except Exception as error:
+            print(f"Failed to connect to Siril: {error}")
+            return None
 
     def createWindow(self):
         """Build the main layout: info panel, plugin sidebar, drop-target batch area, footer."""
@@ -1563,8 +1511,16 @@ class Batch(QMainWindow):
             LogColor.GREEN,
         )
 
+    def _run_batch(self):
+        """Run every plugin instance sequentially."""
+        self.run_button.setEnabled(False)
+        try:
+            self.plugin_container.run_plugins()
+        finally:
+            self.run_button.setEnabled(True)
+
     def _create_buttons_layout(self):
-        """Build the footer button row (Save/Load Presets, Close, Run)."""
+        """Build the footer button row (Save Presets, Close, Run)."""
         footer = QHBoxLayout()
         footer.setContentsMargins(12, 10, 12, 12)
         footer.setSpacing(8)
@@ -1586,23 +1542,11 @@ class Batch(QMainWindow):
         save_presets_button.clicked.connect(self._save_current_batch)
         footer.addWidget(save_presets_button)
 
-        load_presets_button = QPushButton("Load Presets")
-        load_presets_button.setMinimumWidth(80)
-        load_presets_button.setMinimumHeight(35)
-        load_presets_button.setToolTip(
-            'Load previously saved presets. If "presets/naztronomy_smart_scope_presets.json" exists, it will load first, otherwise it\'ll prompt you to find a proper .json file.'
-        )
-        #        load_presets_button.clicked.connect(self.load_presets)
-        footer.addWidget(load_presets_button)
 
         #       button_layout.addStretch()
-
         close_button = QPushButton("Close")
-        close_button.setMinimumWidth(100)
+        close_button.setMinimumWidth(80)
         close_button.setMinimumHeight(35)
-        close_button.setStyleSheet(
-            "QPushButton { background-color: #c70306; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #fc3437; }"
-        )
         close_button.clicked.connect(self.close_dialog)
         footer.addWidget(close_button)
 
@@ -1614,14 +1558,15 @@ class Batch(QMainWindow):
         self.run_button.setStyleSheet(
             "QPushButton { background-color: #0078cc; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #33abff; }"
         )
-        #        self.run_button.clicked.connect(self.on_run_clicked)
+        self.run_button.clicked.connect(self._run_batch)
         footer.addWidget(self.run_button)
 
         return footer
 
     def close_dialog(self):
         """Disconnect from Siril and close the window."""
-        self.siril.disconnect()
+        if self.siril is not None:
+            self.siril.disconnect()
         self.close()
 
 
